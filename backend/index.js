@@ -1,12 +1,14 @@
 import { createServer } from 'node:http'
 import { Buffer } from 'node:buffer'
 import { randomBytes, randomUUID, scryptSync, createHash, timingSafeEqual } from 'node:crypto'
+import { resolve } from 'node:path'
 import process from 'node:process'
+import { fileURLToPath } from 'node:url'
 import { initializeDatabase, pool } from './database.js'
 
 const port = Number(process.env.API_PORT || 3001)
 const isProduction = process.env.NODE_ENV === 'production'
-const sessions = new Map()
+let initializationPromise
 const statuses = new Set(['Active', 'On leave', 'Inactive'])
 const departments = new Set(['Design', 'Engineering', 'Marketing', 'People', 'Sales'])
 const userColumns = 'id, name, email, salt, password_hash AS hash'
@@ -42,18 +44,37 @@ async function findUserByEmail(email) {
   return rows[0] || null
 }
 
-async function readSession(request) {
+function getSessionToken(request) {
   const cookie = request.headers.cookie || ''
-  const token = cookie.split(';').map((part) => part.trim()).find((part) => part.startsWith('peopleflow_session='))?.slice('peopleflow_session='.length)
+  return cookie.split(';').map((part) => part.trim()).find((part) => part.startsWith('peopleflow_session='))?.slice('peopleflow_session='.length) || ''
+}
+
+async function createSession(userId) {
+  const token = randomBytes(32).toString('base64url')
+  const tokenHash = createHash('sha256').update(token).digest('hex')
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 19).replace('T', ' ')
+  await pool.execute(
+    'INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)',
+    [tokenHash, userId, expiresAt],
+  )
+  return token
+}
+
+async function readSession(request) {
+  const token = getSessionToken(request)
   if (!token) return null
-  const session = sessions.get(token)
-  if (!session || session.expiresAt < Date.now()) {
-    sessions.delete(token)
+  const tokenHash = createHash('sha256').update(token).digest('hex')
+  const [sessions] = await pool.execute(
+    'SELECT user_id AS userId FROM sessions WHERE token_hash = ? AND expires_at > UTC_TIMESTAMP() LIMIT 1',
+    [tokenHash],
+  )
+  if (!sessions.length) {
+    await pool.execute('DELETE FROM sessions WHERE token_hash = ?', [tokenHash])
     return null
   }
-  const [rows] = await pool.execute(`SELECT ${userColumns} FROM users WHERE id = ? LIMIT 1`, [session.userId])
+  const [rows] = await pool.execute(`SELECT ${userColumns} FROM users WHERE id = ? LIMIT 1`, [sessions[0].userId])
   if (!rows.length) {
-    sessions.delete(token)
+    await pool.execute('DELETE FROM sessions WHERE token_hash = ?', [tokenHash])
     return null
   }
   return { token, user: rows[0] }
@@ -89,6 +110,16 @@ async function initializeApp() {
   } finally {
     connection.release()
   }
+}
+
+function ensureInitialized() {
+  if (!initializationPromise) {
+    initializationPromise = initializeApp().catch((error) => {
+      initializationPromise = null
+      throw error
+    })
+  }
+  return initializationPromise
 }
 
 function send(response, status, payload, headers = {}) {
@@ -155,7 +186,7 @@ function validateEmployee(input) {
   return { employee }
 }
 
-async function handleRequest(request, response) {
+async function routeRequest(request, response) {
   const url = new URL(request.url, 'http://localhost')
   const path = url.pathname
   const method = request.method
@@ -182,8 +213,7 @@ async function handleRequest(request, response) {
       if (error.code === 'ER_DUP_ENTRY') return send(response, 409, { error: 'An account with this email already exists.' })
       throw error
     }
-    const token = randomBytes(32).toString('base64url')
-    sessions.set(token, { userId: user.id, expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000 })
+    const token = await createSession(user.id)
     setSessionCookie(response, token)
     return send(response, 201, { user: publicUser(user) })
   }
@@ -194,8 +224,7 @@ async function handleRequest(request, response) {
     const password = typeof input.password === 'string' ? input.password : ''
     const user = await findUserByEmail(email)
     if (!user || !verifyPassword(password, user.salt, user.hash)) return send(response, 401, { error: 'Email or password is incorrect.' })
-    const token = randomBytes(32).toString('base64url')
-    sessions.set(token, { userId: user.id, expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000 })
+    const token = await createSession(user.id)
     setSessionCookie(response, token)
     return send(response, 200, { user: publicUser(user) })
   }
@@ -239,17 +268,17 @@ async function handleRequest(request, response) {
       [credentials.salt, credentials.hash, user.id],
     )
     await pool.execute('DELETE FROM password_reset_tokens WHERE user_id = ?', [user.id])
-    for (const [sessionToken, session] of sessions) {
-      if (session.userId === user.id) sessions.delete(sessionToken)
-    }
+    await pool.execute('DELETE FROM sessions WHERE user_id = ?', [user.id])
     clearSessionCookie(response)
     return send(response, 200, { message: 'Your password has been updated. You can sign in now.' })
   }
 
   if (method === 'POST' && path === '/api/auth/logout') {
-    const cookie = request.headers.cookie || ''
-    const token = cookie.split(';').map((part) => part.trim()).find((part) => part.startsWith('peopleflow_session='))?.slice('peopleflow_session='.length)
-    if (token) sessions.delete(token)
+    const token = getSessionToken(request)
+    if (token) {
+      const tokenHash = createHash('sha256').update(token).digest('hex')
+      await pool.execute('DELETE FROM sessions WHERE token_hash = ?', [tokenHash])
+    }
     clearSessionCookie(response)
     return send(response, 200, { message: 'Signed out.' })
   }
@@ -329,10 +358,10 @@ async function handleRequest(request, response) {
   return send(response, 404, { error: 'Not found.' })
 }
 
-await initializeApp()
-const server = createServer(async (request, response) => {
+export async function handleRequest(request, response) {
   try {
-    await handleRequest(request, response)
+    await ensureInitialized()
+    await routeRequest(request, response)
   } catch (error) {
     if (response.headersSent) {
       response.destroy(error)
@@ -341,9 +370,13 @@ const server = createServer(async (request, response) => {
     console.error('API request failed:', error)
     send(response, error.status || 500, { error: error.status ? error.message : 'Something went wrong on the server.' })
   }
-})
+}
 
-server.listen(port, '0.0.0.0', () => {
-  console.log(`Peopleflow API listening on http://localhost:${port}`)
-  console.log('Demo sign in: demo@peopleflow.com / Demo123!')
-})
+if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1])) {
+  await ensureInitialized()
+  const server = createServer(handleRequest)
+  server.listen(port, '0.0.0.0', () => {
+    console.log(`Peopleflow API listening on http://localhost:${port}`)
+    console.log('Demo sign in: demo@peopleflow.com / Demo123!')
+  })
+}

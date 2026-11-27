@@ -1,3 +1,14 @@
 {
-  "outputDirectory": "frontend/dist"
+  "outputDirectory": "frontend/dist",
+  "rewrites": [
+    {
+      "source": "/api/:path*",
+      "destination": "/api/index?path=:path*"
+    }
+  ],
+  "functions": {
+    "api/index.js": {
+      "includeFiles": "backend/schema.sql"
+    }
+  }
 }
