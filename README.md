@@ -39,7 +39,7 @@ The API generates single-use reset codes that expire after 15 minutes. Because t
 
 ## Deploy to Vercel
 
-Set the Vercel project root to the repository root. `vercel.json` directs Vercel to the Vite output in `frontend/dist` and routes `/api/*` requests to the Node.js function in `api/index.js`. The API stores login sessions in MySQL so they work across serverless instances.
+Set the Vercel project root to the repository root. Vite builds the frontend into the root `dist` directory to match Vercel's output setting in `vercel.json`, which also routes `/api/*` requests to the Node.js function in `api/index.js`. The API stores login sessions in MySQL so they work across serverless instances.
 
 Add `MYSQL_HOST`, `MYSQL_PORT`, `MYSQL_USER`, `MYSQL_PASSWORD`, and `MYSQL_DATABASE` as Vercel environment variables. Use a MySQL server reachable from Vercel; `localhost` and `127.0.0.1` refer to the function itself, not your computer. TLS is enabled by default on Vercel; set `MYSQL_SSL=false` only if your database provider does not support TLS. The database user needs permission to create the tables in `backend/schema.sql` on initial startup. Do not put production credentials in `backend/.env.example` or commit them.
 

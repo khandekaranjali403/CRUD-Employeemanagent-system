@@ -1,5 +1,5 @@
 {
-  "outputDirectory": "backend/dist",
+  "outputDirectory": "dist",
   "rewrites": [
     {
       "source": "/api/:path*",

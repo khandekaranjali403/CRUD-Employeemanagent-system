@@ -10,6 +10,10 @@ export default defineConfig({
     apply: 'serve',
   },
   plugins: [react()],
+  build: {
+    outDir: fileURLToPath(new URL('../dist', import.meta.url)),
+    emptyOutDir: true,
+  },
   server: {
     proxy: {
       '/api': 'http://localhost:3001',
