@@ -6,14 +6,13 @@
   "scripts": {
     "dev": "vite --config frontend/vite.config.js",
     "server": "node backend/index.js",
-    "migrate:json": "node backend/migrate-json-to-mysql.js",
     "build": "vite build --config frontend/vite.config.js",
     "lint": "eslint .",
     "preview": "vite preview --config frontend/vite.config.js"
   },
   "dependencies": {
     "dotenv": "^18.0.10",
-    "mysql2": "^3.24.6",
+    "mongodb": "^7.9.1",
     "react": "^19.3.1",
     "react-dom": "^19.3.1"
   },

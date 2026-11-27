@@ -1,18 +1,17 @@
 import { createServer } from 'node:http'
 import { Buffer } from 'node:buffer'
-import { randomBytes, randomUUID, scryptSync, createHash, timingSafeEqual } from 'node:crypto'
+import { randomBytes, scryptSync, createHash, timingSafeEqual } from 'node:crypto'
 import { resolve } from 'node:path'
 import process from 'node:process'
 import { fileURLToPath } from 'node:url'
-import { initializeDatabase, pool } from './database.js'
+import { ObjectId } from 'mongodb'
+import { db, initializeDatabase } from './database.js'
 
 const port = Number(process.env.API_PORT || 3001)
 const isProduction = process.env.NODE_ENV === 'production'
 let initializationPromise
 const statuses = new Set(['Active', 'On leave', 'Inactive'])
 const departments = new Set(['Design', 'Engineering', 'Marketing', 'People', 'Sales'])
-const userColumns = 'id, name, email, salt, password_hash AS hash'
-const employeeColumns = "id, owner_id AS ownerId, name, email, role, department, status, location, DATE_FORMAT(start_date, '%Y-%m-%d') AS startDate"
 
 const demoEmployees = [
   ['Olivia Chen', 'olivia.chen@studionorth.co', 'Product Designer', 'Design', 'Active', 'San Francisco, CA', '2022-03-14'],
@@ -36,12 +35,25 @@ function verifyPassword(password, salt, expectedHash) {
 }
 
 function publicUser(user) {
-  return { id: user.id, name: user.name, email: user.email }
+  return { id: user._id.toString(), name: user.name, email: user.email }
+}
+
+function publicEmployee(employee) {
+  return {
+    id: employee._id.toString(),
+    ownerId: employee.ownerId.toString(),
+    name: employee.name,
+    email: employee.email,
+    role: employee.role,
+    department: employee.department,
+    status: employee.status,
+    location: employee.location,
+    startDate: employee.startDate,
+  }
 }
 
 async function findUserByEmail(email) {
-  const [rows] = await pool.execute(`SELECT ${userColumns} FROM users WHERE email = ? LIMIT 1`, [email])
-  return rows[0] || null
+  return db.collection('users').findOne({ email })
 }
 
 function getSessionToken(request) {
@@ -52,11 +64,8 @@ function getSessionToken(request) {
 async function createSession(userId) {
   const token = randomBytes(32).toString('base64url')
   const tokenHash = createHash('sha256').update(token).digest('hex')
-  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString().slice(0, 19).replace('T', ' ')
-  await pool.execute(
-    'INSERT INTO sessions (token_hash, user_id, expires_at) VALUES (?, ?, ?)',
-    [tokenHash, userId, expiresAt],
-  )
+  const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000)
+  await db.collection('sessions').insertOne({ _id: tokenHash, userId, expiresAt })
   return token
 }
 
@@ -64,52 +73,41 @@ async function readSession(request) {
   const token = getSessionToken(request)
   if (!token) return null
   const tokenHash = createHash('sha256').update(token).digest('hex')
-  const [sessions] = await pool.execute(
-    'SELECT user_id AS userId FROM sessions WHERE token_hash = ? AND expires_at > UTC_TIMESTAMP() LIMIT 1',
-    [tokenHash],
-  )
-  if (!sessions.length) {
-    await pool.execute('DELETE FROM sessions WHERE token_hash = ?', [tokenHash])
+  const sessions = db.collection('sessions')
+  const session = await sessions.findOne({ _id: tokenHash, expiresAt: { $gt: new Date() } })
+  if (!session) {
+    await sessions.deleteOne({ _id: tokenHash })
     return null
   }
-  const [rows] = await pool.execute(`SELECT ${userColumns} FROM users WHERE id = ? LIMIT 1`, [sessions[0].userId])
-  if (!rows.length) {
-    await pool.execute('DELETE FROM sessions WHERE token_hash = ?', [tokenHash])
+  const user = await db.collection('users').findOne({ _id: session.userId })
+  if (!user) {
+    await sessions.deleteOne({ _id: tokenHash })
     return null
   }
-  return { token, user: rows[0] }
+  return { token, user }
 }
 
 async function initializeApp() {
   await initializeDatabase()
   if (isProduction) return
 
-  const [existingUsers] = await pool.execute('SELECT id FROM users WHERE email = ? LIMIT 1', ['demo@peopleflow.com'])
-  if (existingUsers.length) return
+  const users = db.collection('users')
+  if (await users.findOne({ email: 'demo@peopleflow.com' })) return
 
-  const user = { id: randomUUID(), name: 'Jamie Rivera', email: 'demo@peopleflow.com', ...hashPassword('Demo123!') }
-  const connection = await pool.getConnection()
-  try {
-    await connection.beginTransaction()
-    await connection.execute(
-      'INSERT INTO users (id, name, email, salt, password_hash) VALUES (?, ?, ?, ?, ?)',
-      [user.id, user.name, user.email, user.salt, user.hash],
-    )
-    for (const [name, email, role, department, status, location, startDate] of demoEmployees) {
-      await connection.execute(
-        `INSERT INTO employees
-          (id, owner_id, name, email, role, department, status, location, start_date)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [randomUUID(), user.id, name, email, role, department, status, location, startDate],
-      )
-    }
-    await connection.commit()
-  } catch (error) {
-    await connection.rollback()
-    throw error
-  } finally {
-    connection.release()
-  }
+  const user = { name: 'Jamie Rivera', email: 'demo@peopleflow.com', ...hashPassword('Demo123!'), createdAt: new Date() }
+  const { insertedId: ownerId } = await users.insertOne(user)
+  const employees = demoEmployees.map(([name, email, role, department, status, location, startDate]) => ({
+    ownerId,
+    name,
+    email,
+    role,
+    department,
+    status,
+    location,
+    startDate,
+    createdAt: new Date(),
+  }))
+  await db.collection('employees').insertMany(employees)
 }
 
 function ensureInitialized() {
@@ -203,17 +201,15 @@ async function routeRequest(request, response) {
     if (name.length < 2 || name.length > 80) return send(response, 400, { error: 'Name must be between 2 and 80 characters.' })
     if (email.length > 254 || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return send(response, 400, { error: 'Enter a valid email address.' })
     if (password.length < 8 || password.length > 128) return send(response, 400, { error: 'Password must be between 8 and 128 characters.' })
-    const user = { id: randomUUID(), name, email, ...hashPassword(password) }
+    const user = { name, email, ...hashPassword(password), createdAt: new Date() }
     try {
-      await pool.execute(
-        'INSERT INTO users (id, name, email, salt, password_hash) VALUES (?, ?, ?, ?, ?)',
-        [user.id, user.name, user.email, user.salt, user.hash],
-      )
+      const { insertedId } = await db.collection('users').insertOne(user)
+      user._id = insertedId
     } catch (error) {
-      if (error.code === 'ER_DUP_ENTRY') return send(response, 409, { error: 'An account with this email already exists.' })
+      if (error.code === 11000) return send(response, 409, { error: 'An account with this email already exists.' })
       throw error
     }
-    const token = await createSession(user.id)
+    const token = await createSession(user._id)
     setSessionCookie(response, token)
     return send(response, 201, { user: publicUser(user) })
   }
@@ -224,7 +220,7 @@ async function routeRequest(request, response) {
     const password = typeof input.password === 'string' ? input.password : ''
     const user = await findUserByEmail(email)
     if (!user || !verifyPassword(password, user.salt, user.hash)) return send(response, 401, { error: 'Email or password is incorrect.' })
-    const token = await createSession(user.id)
+    const token = await createSession(user._id)
     setSessionCookie(response, token)
     return send(response, 200, { user: publicUser(user) })
   }
@@ -237,11 +233,11 @@ async function routeRequest(request, response) {
     if (user) {
       const token = randomBytes(24).toString('base64url')
       const tokenHash = createHash('sha256').update(token).digest('hex')
-      const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString().slice(0, 19).replace('T', ' ')
-      await pool.execute(
-        `INSERT INTO password_reset_tokens (user_id, token_hash, expires_at) VALUES (?, ?, ?)
-         ON DUPLICATE KEY UPDATE token_hash = ?, expires_at = ?`,
-        [user.id, tokenHash, expiresAt, tokenHash, expiresAt],
+      const expiresAt = new Date(Date.now() + 15 * 60 * 1000)
+      await db.collection('passwordResetTokens').updateOne(
+        { _id: user._id },
+        { $set: { tokenHash, expiresAt } },
+        { upsert: true },
       )
       if (!isProduction) result.resetToken = token
     }
@@ -257,18 +253,16 @@ async function routeRequest(request, response) {
     const user = await findUserByEmail(email)
     const tokenHash = createHash('sha256').update(token).digest('hex')
     if (!user) return send(response, 400, { error: 'That reset code is invalid or has expired. Request a new one and try again.' })
-    const [resetTokens] = await pool.execute(
-      'SELECT user_id FROM password_reset_tokens WHERE user_id = ? AND token_hash = ? AND expires_at > UTC_TIMESTAMP() LIMIT 1',
-      [user.id, tokenHash],
-    )
-    if (!resetTokens.length) return send(response, 400, { error: 'That reset code is invalid or has expired. Request a new one and try again.' })
+    const resetToken = await db.collection('passwordResetTokens').findOne({
+      _id: user._id,
+      tokenHash,
+      expiresAt: { $gt: new Date() },
+    })
+    if (!resetToken) return send(response, 400, { error: 'That reset code is invalid or has expired. Request a new one and try again.' })
     const credentials = hashPassword(password)
-    await pool.execute(
-      'UPDATE users SET salt = ?, password_hash = ? WHERE id = ?',
-      [credentials.salt, credentials.hash, user.id],
-    )
-    await pool.execute('DELETE FROM password_reset_tokens WHERE user_id = ?', [user.id])
-    await pool.execute('DELETE FROM sessions WHERE user_id = ?', [user.id])
+    await db.collection('users').updateOne({ _id: user._id }, { $set: credentials })
+    await db.collection('passwordResetTokens').deleteOne({ _id: user._id })
+    await db.collection('sessions').deleteMany({ userId: user._id })
     clearSessionCookie(response)
     return send(response, 200, { message: 'Your password has been updated. You can sign in now.' })
   }
@@ -277,7 +271,7 @@ async function routeRequest(request, response) {
     const token = getSessionToken(request)
     if (token) {
       const tokenHash = createHash('sha256').update(token).digest('hex')
-      await pool.execute('DELETE FROM sessions WHERE token_hash = ?', [tokenHash])
+      await db.collection('sessions').deleteOne({ _id: tokenHash })
     }
     clearSessionCookie(response)
     return send(response, 200, { message: 'Signed out.' })
@@ -292,66 +286,53 @@ async function routeRequest(request, response) {
   if (!session) return send(response, 401, { error: 'Please sign in to continue.' })
 
   if (method === 'GET' && path === '/api/employees') {
-    const [employees] = await pool.execute(
-      `SELECT ${employeeColumns} FROM employees
-       WHERE owner_id = ? ORDER BY created_at ASC, id ASC`,
-      [session.user.id],
-    )
-    return send(response, 200, { employees })
+    const employees = await db.collection('employees')
+      .find({ ownerId: session.user._id })
+      .sort({ createdAt: 1, _id: 1 })
+      .toArray()
+    return send(response, 200, { employees: employees.map(publicEmployee) })
   }
 
   if (method === 'POST' && path === '/api/employees') {
     const input = await readJson(request)
     const validation = validateEmployee(input)
     if (validation.error) return send(response, 400, { error: validation.error })
-    const employee = { id: randomUUID(), ownerId: session.user.id, ...validation.employee }
+    const employee = { ownerId: session.user._id, ...validation.employee, createdAt: new Date() }
     try {
-      await pool.execute(
-        `INSERT INTO employees
-          (id, owner_id, name, email, role, department, status, location, start_date)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [employee.id, employee.ownerId, employee.name, employee.email, employee.role, employee.department, employee.status, employee.location, employee.startDate],
-      )
+      const { insertedId } = await db.collection('employees').insertOne(employee)
+      employee._id = insertedId
     } catch (error) {
-      if (error.code === 'ER_DUP_ENTRY') return send(response, 409, { error: 'An employee with this email already exists.' })
+      if (error.code === 11000) return send(response, 409, { error: 'An employee with this email already exists.' })
       throw error
     }
-    return send(response, 201, { employee })
+    return send(response, 201, { employee: publicEmployee(employee) })
   }
 
-  const employeeMatch = path.match(/^\/api\/employees\/([0-9a-f-]+)$/i)
+  const employeeMatch = path.match(/^\/api\/employees\/([0-9a-f]{24})$/i)
   if (employeeMatch && method === 'PUT') {
     const input = await readJson(request)
     const validation = validateEmployee(input)
     if (validation.error) return send(response, 400, { error: validation.error })
-    const employee = { id: employeeMatch[1], ownerId: session.user.id, ...validation.employee }
+    const employee = { _id: new ObjectId(employeeMatch[1]), ownerId: session.user._id, ...validation.employee }
     try {
-      const [result] = await pool.execute(
-        `UPDATE employees
-         SET name = ?, email = ?, role = ?, department = ?, status = ?, location = ?, start_date = ?
-         WHERE id = ? AND owner_id = ?`,
-        [employee.name, employee.email, employee.role, employee.department, employee.status, employee.location, employee.startDate, employee.id, employee.ownerId],
+      const result = await db.collection('employees').updateOne(
+        { _id: employee._id, ownerId: employee.ownerId },
+        { $set: validation.employee },
       )
-      if (!result.affectedRows) {
-        const [existing] = await pool.execute(
-          'SELECT id FROM employees WHERE id = ? AND owner_id = ? LIMIT 1',
-          [employee.id, employee.ownerId],
-        )
-        if (!existing.length) return send(response, 404, { error: 'Employee not found.' })
-      }
+      if (!result.matchedCount) return send(response, 404, { error: 'Employee not found.' })
     } catch (error) {
-      if (error.code === 'ER_DUP_ENTRY') return send(response, 409, { error: 'An employee with this email already exists.' })
+      if (error.code === 11000) return send(response, 409, { error: 'An employee with this email already exists.' })
       throw error
     }
-    return send(response, 200, { employee })
+    return send(response, 200, { employee: publicEmployee(employee) })
   }
 
   if (employeeMatch && method === 'DELETE') {
-    const [result] = await pool.execute(
-      'DELETE FROM employees WHERE id = ? AND owner_id = ?',
-      [employeeMatch[1], session.user.id],
-    )
-    if (!result.affectedRows) return send(response, 404, { error: 'Employee not found.' })
+    const result = await db.collection('employees').deleteOne({
+      _id: new ObjectId(employeeMatch[1]),
+      ownerId: session.user._id,
+    })
+    if (!result.deletedCount) return send(response, 404, { error: 'Employee not found.' })
     return send(response, 200, { message: 'Employee removed.' })
   }
 
